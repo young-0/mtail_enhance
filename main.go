@@ -5,12 +5,14 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -31,9 +33,10 @@ func (f *seqStringFlag) Set(value string) error {
 }
 
 var (
-	port   = flag.String("port", "3903", "HTTP port to listen on.")
-	progs  = flag.String("progs", "/etc/mtail/", "Name of the directory containing mtail programs")
-	period = flag.Int("period", 1, "logs file check period, Unit is minutes")
+	port    = flag.String("port", "3903", "HTTP port to listen on.")
+	progs   = flag.String("progs", "/etc/mtail/", "Name of the directory containing mtail programs")
+	period  = flag.Int("period", 1, "logs file check period, Unit is minutes")
+	isDebug = flag.Bool("debug", false, "Output verbose debug information")
 )
 
 func init() {
@@ -46,59 +49,97 @@ var (
 
 func main() {
 	flag.Parse()
-	fmt.Println(logList)
-	go func() {
-		var lastLogsAddr string
-		logList = append([]string{"find"}, logList...)
-		for {
-			cmdFindLogs := exec.Command("bash", "-c", strings.Join(logList, " "))
-			var stdout, stderr bytes.Buffer
-			cmdFindLogs.Stdout = &stdout
-			cmdFindLogs.Stderr = &stderr
-			err := cmdFindLogs.Run()
-			if err != nil {
-				log.Warningf("cmd.Run() failed with %s\n", err)
-			}
-			outStr, errStr := string(stdout.Bytes()), string(stderr.Bytes())
-			if errStr != "" {
-				fmt.Printf("out:\n%s\nerr:\n%s\n", outStr, errStr)
-			}
-			LogsAddr := strings.Join(strings.Split(strings.TrimSpace(outStr), "\n"), ",")
-			if lastLogsAddr == "" && LogsAddr == "" {
-				log.Warningf("No log file found, Please check config.\n")
-			} else if lastLogsAddr == "" && LogsAddr != "" {
-				fmt.Printf("First run:\n--logs %s\n", LogsAddr)
-				addrChan <- LogsAddr
-				lastLogsAddr = LogsAddr
-			} else if lastLogsAddr != "" && LogsAddr != "" && LogsAddr != lastLogsAddr {
-				fmt.Printf("File change:\nlast: %s\nnow :%s\n", lastLogsAddr, LogsAddr)
-				addrChan <- LogsAddr
-				lastLogsAddr = LogsAddr
-			}
-			time.Sleep(time.Duration(*period)*time.Minute )
-		}
-	}()
+	if *isDebug {
+		log.SetLevel(log.DebugLevel)
+		log.Debugln("Enabling debug output")
+	} else {
+		log.SetLevel(log.InfoLevel)
+	}
+	log.SetFormatter(&log.TextFormatter{
+		DisableColors: true,
+		FullTimestamp: true,
+	})
+	fmt.Printf("parameter logList：\n")
+	for n, a := range logList {
+		fmt.Printf("%d\t%s\n", n, a)
+	}
+	go monitorConfigFiles()
 	mtailReload()
 }
-func mtailReload() {
-	var flag = 0
-	var cmdMtail = &exec.Cmd{}
-	for logsAddr := range addrChan {
-		// Kill it, ignore the first time
-		if flag != 0 {
-			fmt.Println("process killed", time.Now())
-			if err := cmdMtail.Process.Kill(); err != nil {
-				log.Fatal("failed to kill process: ", err)
-			}
+func removeDuplicateElement(l []string) []string {
+	r := make([]string, 0, len(l))
+	temp := map[string]int{}
+	for _, item := range l {
+		if _, ok := temp[item]; !ok {
+			temp[item] = 0
+			r = append(r, item)
 		}
-		flag++
-		cmdMtail.Wait()
-		fmt.Println("process start", time.Now())
-		cmdMtail = exec.Command("mtail", "--port",*port,"--logs",logsAddr,"--progs", *progs)
+	}
+	return r
+}
+func getConfigFiles(path string) (configFiles []string, err error) {
+	// Create empty slice for config file list
+	configFiles = make([]string, 0)
+	files, err := filepath.Glob(path)
+	if err != nil {
+		return nil, err
+	}
+	configFiles = append(configFiles, files...)
+	return configFiles, nil
+}
+func monitorConfigFiles() {
+	var lastConfigFileStr string
+	for {
+		var logFiles = make([]string, 0)
+		for _, logAddr := range logList {
+			files, err := getConfigFiles(logAddr)
+			if err != nil {
+				log.Errorf("logAddr %s parse err: %s\n", logAddr, err)
+				continue
+			}
+			logFiles = append(logFiles, files...)
+		}
+		logFiles = removeDuplicateElement(logFiles)
+		sort.Strings(logFiles)
+		configFilesStr := strings.Join(logFiles, ",")
+		if len(configFilesStr) == 0 && len(lastConfigFileStr) == 0 {
+			log.Warningf("No log file found, Please check config.\n")
+		} else if len(configFilesStr) > 0 && len(lastConfigFileStr) == 0 {
+			log.Info("logFiles first search\n")
+			for n, a := range logFiles {
+				log.Debugf("%d\t%s\n", n, a)
+			}
+			addrChan <- configFilesStr
+			lastConfigFileStr = configFilesStr
+		} else if len(configFilesStr) > 0 && len(lastConfigFileStr) > 0 && configFilesStr != lastConfigFileStr {
+			log.Info("logFiles change\n")
+			for n, a := range logFiles {
+				log.Debugf("%d\t%s\n", n, a)
+			}
+			addrChan <- configFilesStr
+			lastConfigFileStr = configFilesStr
+		} else {
+			log.Debugf("Configuration file has not changed\n")
+		}
+		time.Sleep(time.Duration(*period) * time.Minute)
+	}
+}
+func mtailReload() {
+	configFilesStr := <-addrChan
+	for {
+		ctx, cancel := context.WithCancel(context.Background())
+		cmdMtail := exec.CommandContext(ctx, "mtail", "--port", *port,
+			"--progs", *progs, "--override_timezone", "Local", "--disable_fsnotify",
+			"--logs", configFilesStr)
 		cmdMtail.Stdout = os.Stdout
 		cmdMtail.Stderr = os.Stderr
 		if err := cmdMtail.Start(); err != nil {
 			log.Warning(err)
+		}
+		configFilesStr = <-addrChan
+		cancel()
+		if err := cmdMtail.Wait(); err != nil {
+			log.Errorf("exec wait info: %v\n", err)
 		}
 	}
 }
